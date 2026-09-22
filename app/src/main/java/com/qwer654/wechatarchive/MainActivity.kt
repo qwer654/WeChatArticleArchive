@@ -392,6 +392,7 @@ private fun ArchiveScreen(activity: MainActivity, incomingText: String) {
                                         var existed = 0
                                         var failed = 0
                                         var filtered = 0
+                                        val verificationBlocked = mutableListOf<String>()
                                         var page = 1
                                         var consecutiveExisting = 0
                                         var stop = false
@@ -435,8 +436,12 @@ private fun ArchiveScreen(activity: MainActivity, incomingText: String) {
 
                                                     val parsed = try {
                                                         withContext(Dispatchers.IO) { collector.fetch(item.url) }
-                                                    } catch (_: Throwable) {
-                                                        failed++
+                                                    } catch (t: Throwable) {
+                                                        if (t is VerificationRequiredException) {
+                                                            verificationBlocked += item.url
+                                                        } else {
+                                                            failed++
+                                                        }
                                                         continue
                                                     }
 
@@ -471,9 +476,15 @@ private fun ArchiveScreen(activity: MainActivity, incomingText: String) {
                                             }
 
                                             records = withContext(Dispatchers.IO) { repository.listAll() }
+                                            if (verificationBlocked.isNotEmpty()) {
+                                                input = verificationBlocked.distinct().joinToString("\n")
+                                            }
                                             status = "历史同步完成：" + mp.name +
                                                 "；新增 " + added + "，本地已有 " + existed +
-                                                "，筛选跳过 " + filtered + "，失败 " + failed + "。"
+                                                "，筛选跳过 " + filtered +
+                                                "，需浏览器采集 " + verificationBlocked.distinct().size +
+                                                "，其他失败 " + failed + "。" +
+                                                if (verificationBlocked.isNotEmpty()) " 需浏览器处理的链接已放入输入框。" else ""
                                         } catch (t: Throwable) {
                                             status = "历史同步停止：" + t.message
                                         }
@@ -505,6 +516,7 @@ private fun ArchiveScreen(activity: MainActivity, incomingText: String) {
         }
 
         items(records, key = { it.id }) { record ->
+            val usable = remember(record.id, record.hash, record.path) { repository.isUsable(record) }
             Card(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
                     Text(record.title, fontWeight = FontWeight.SemiBold)
@@ -514,10 +526,31 @@ private fun ArchiveScreen(activity: MainActivity, incomingText: String) {
                         style = MaterialTheme.typography.bodySmall
                     )
                     Text(record.url, style = MaterialTheme.typography.bodySmall, maxLines = 1)
-                    Button(onClick = {
-                        exportRecord = record
-                        exporter.launch(fileName(record.publishDate + "_" + record.title + ".md"))
-                    }) { Text("导出单个 .md") }
+                    if (!usable) {
+                        Text(
+                            "此记录是异常页或内容不完整，需要重新采集。",
+                            color = MaterialTheme.colorScheme.error,
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                            enabled = usable,
+                            onClick = {
+                                exportRecord = record
+                                exporter.launch(fileName(record.publishDate + "_" + record.title + ".md"))
+                            }
+                        ) { Text("导出单个 .md") }
+
+                        if (!usable) {
+                            OutlinedButton(onClick = {
+                                browserCapture.launch(
+                                    Intent(activity, WebViewCaptureActivity::class.java)
+                                        .putExtra(WebViewCaptureActivity.EXTRA_URL, record.url)
+                                )
+                            }) { Text("浏览器重新采集") }
+                        }
+                    }
                 }
             }
         }
