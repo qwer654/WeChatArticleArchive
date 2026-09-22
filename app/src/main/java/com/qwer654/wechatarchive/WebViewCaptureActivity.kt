@@ -109,7 +109,7 @@ class WebViewCaptureActivity : ComponentActivity() {
                 return@evaluateJavascript
             }
 
-            val currentUrl = webView.url?.takeIf { it.startsWith("http") } ?: originalUrl
+            val currentUrl = originalUrl
             lifecycleScope.launch {
                 runCatching {
                     val parsed = withContext(Dispatchers.Default) {
@@ -136,8 +136,10 @@ class WebViewCaptureActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
-        webView.stopLoading()
-        webView.destroy()
+        if (::webView.isInitialized) {
+            webView.stopLoading()
+            webView.destroy()
+        }
         super.onDestroy()
     }
 
