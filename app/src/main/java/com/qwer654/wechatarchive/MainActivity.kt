@@ -116,6 +116,15 @@ private fun ArchiveScreen(activity: MainActivity, incomingText: String) {
         exportRecord = null
     }
 
+    val browserCapture = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == android.app.Activity.RESULT_OK) {
+            records = repository.listAll()
+            status = "浏览器模式采集完成，已从实际加载的微信页面重新解析正文。"
+        }
+    }
+
     fun range(months: Long) {
         start = LocalDate.now().minusMonths(months).toString()
         end = LocalDate.now().toString()
@@ -230,11 +239,12 @@ private fun ArchiveScreen(activity: MainActivity, incomingText: String) {
                             var existed = 0
                             var skipped = 0
                             var failed = 0
+                            var fallbackUrl: String? = null
 
                             urls.forEachIndexed { index, url ->
                                 status = "正在处理 " + (index + 1) + "/" + urls.size
                                 val local = withContext(Dispatchers.IO) { repository.findByUrl(url) }
-                                if (local != null) {
+                                if (local != null && repository.isUsable(local)) {
                                     existed++
                                     return@forEachIndexed
                                 }
@@ -242,6 +252,9 @@ private fun ArchiveScreen(activity: MainActivity, incomingText: String) {
                                 val parsed = runCatching {
                                     withContext(Dispatchers.IO) { collector.fetch(url) }
                                 }.getOrElse {
+                                    if (it is VerificationRequiredException && fallbackUrl == null) {
+                                        fallbackUrl = url
+                                    }
                                     failed++
                                     return@forEachIndexed
                                 }
@@ -267,10 +280,36 @@ private fun ArchiveScreen(activity: MainActivity, incomingText: String) {
                             records = withContext(Dispatchers.IO) { repository.listAll() }
                             status = "完成：新增 $added，已有 $existed，筛选跳过 $skipped，失败 $failed。"
                             working = false
+                            val fallback = fallbackUrl
+                            if (fallback != null && urls.size == 1) {
+                                status = "检测到微信环境验证页，已切换到浏览器模式。完成页面验证并看到正文后，点击“采集当前页面”。"
+                                browserCapture.launch(
+                                    Intent(activity, WebViewCaptureActivity::class.java)
+                                        .putExtra(WebViewCaptureActivity.EXTRA_URL, fallback)
+                                )
+                            }
                         }
                     }
                 ) { Text(if (working) "处理中…" else "开始采集") }
             }
+        }
+
+        item {
+            OutlinedButton(
+                enabled = !working,
+                modifier = Modifier.fillMaxWidth(),
+                onClick = {
+                    val url = wechatUrls(input).firstOrNull()
+                    if (url == null) {
+                        status = "请先输入一篇微信公众号文章链接。"
+                    } else {
+                        browserCapture.launch(
+                            Intent(activity, WebViewCaptureActivity::class.java)
+                                .putExtra(WebViewCaptureActivity.EXTRA_URL, url)
+                        )
+                    }
+                }
+            ) { Text("浏览器模式采集（验证页/内容异常时使用）") }
         }
 
         item {
@@ -381,7 +420,7 @@ private fun ArchiveScreen(activity: MainActivity, incomingText: String) {
                                                     val local = withContext(Dispatchers.IO) {
                                                         repository.findByUrl(item.url)
                                                     }
-                                                    if (local != null) {
+                                                    if (local != null && repository.isUsable(local)) {
                                                         existed++
                                                         consecutiveExisting++
                                                         if (consecutiveExisting >= 20) {
