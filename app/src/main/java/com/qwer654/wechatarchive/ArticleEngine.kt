@@ -165,8 +165,10 @@ class ArticleCollector {
 
         val account = first(
             doc.selectFirst("#js_name")?.text(),
+            doc.selectFirst("#js_profile_qrcode .profile_nickname")?.text(),
             doc.selectFirst(".profile_nickname")?.text(),
             doc.selectFirst(".rich_media_meta_nickname")?.text(),
+            doc.selectFirst(".wx_follow_nickname")?.text(),
             regex(html, """var\s+nickname\s*=\s*["']([^"']+)["']""")
         )
 
@@ -179,7 +181,8 @@ class ArticleCollector {
         )
 
         val publishDate = parseDate(doc.selectFirst("#publish_time")?.text())
-            ?: regex(html, """var\s+ct\s*=\s*["']?(\d{10,13})""")?.toLongOrNull()?.let {
+            ?: metaTexts.firstNotNullOfOrNull { parseDate(it) }
+            ?: regex(html, """var\s+(?:ct|publish_time|ori_create_time)\s*=\s*["']?(\d{10,13})""")?.toLongOrNull()?.let {
                 val seconds = if (it > 99999999999L) it / 1000L else it
                 Instant.ofEpochSecond(seconds).atZone(ZoneId.systemDefault()).toLocalDate()
             }
@@ -265,7 +268,7 @@ class ArticleCollector {
         Regex(p).find(text)?.groupValues?.getOrNull(1)?.trim()
 
     private fun looksLikeDate(text: String): Boolean =
-        Regex("""d{4}[-/年]d{1,2}[-/月]d{1,2}""").containsMatchIn(text)
+        Regex("""\\d{4}[-/年]\\d{1,2}[-/月]\\d{1,2}""").containsMatchIn(text)
 
     private fun parseDate(text: String?): LocalDate? {
         val v = text.orEmpty()
