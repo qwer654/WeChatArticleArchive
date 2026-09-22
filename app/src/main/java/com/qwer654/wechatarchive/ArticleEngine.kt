@@ -157,6 +157,8 @@ class ArticleCollector {
 
         val title = first(
             doc.selectFirst("#activity-name")?.text(),
+            doc.selectFirst("h1.rich_media_title")?.text(),
+            doc.selectFirst(".rich_media_title")?.text(),
             doc.selectFirst("meta[property=og:title]")?.attr("content"),
             doc.title()
         ).ifBlank { "未命名文章" }
@@ -168,9 +170,12 @@ class ArticleCollector {
             regex(html, """var\s+nickname\s*=\s*["']([^"']+)["']""")
         )
 
+        val metaTexts = doc.select(".rich_media_meta_text").map { it.text().trim() }.filter { it.isNotBlank() }
         val author = first(
             doc.selectFirst("#js_author_name")?.text(),
-            doc.selectFirst("meta[name=author]")?.attr("content")
+            doc.selectFirst("meta[name=author]")?.attr("content"),
+            regex(html, """vars+authors*=s*["']([^"']+)["']"""),
+            metaTexts.firstOrNull { it != account && !looksLikeDate(it) && it.length <= 60 }
         )
 
         val publishDate = parseDate(doc.selectFirst("#publish_time")?.text())
@@ -258,6 +263,9 @@ class ArticleCollector {
 
     private fun regex(text: String, p: String): String? =
         Regex(p).find(text)?.groupValues?.getOrNull(1)?.trim()
+
+    private fun looksLikeDate(text: String): Boolean =
+        Regex("""d{4}[-/年]d{1,2}[-/月]d{1,2}""").containsMatchIn(text)
 
     private fun parseDate(text: String?): LocalDate? {
         val v = text.orEmpty()
