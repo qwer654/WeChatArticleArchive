@@ -7,6 +7,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -35,12 +36,17 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.time.Instant
 import java.time.LocalDate
+import java.time.ZoneId
 
 class MainActivity : ComponentActivity() {
     private var incomingText by mutableStateOf("")
@@ -74,7 +80,10 @@ class MainActivity : ComponentActivity() {
 private fun ArchiveScreen(activity: MainActivity, incomingText: String) {
     val repository = remember { ArchiveRepository(activity.applicationContext) }
     val collector = remember { ArticleCollector() }
+    val historyClient = remember { WeReadHistoryClient(activity.applicationContext) }
     val scope = rememberCoroutineScope()
+    var credential by remember { mutableStateOf(historyClient.savedCredential()) }
+    var loginSession by remember { mutableStateOf<LoginSession?>(null) }
 
     var input by rememberSaveable { mutableStateOf("") }
     var filter by rememberSaveable { mutableStateOf("") }
@@ -261,6 +270,192 @@ private fun ArchiveScreen(activity: MainActivity, incomingText: String) {
                         }
                     }
                 ) { Text(if (working) "处理中…" else "开始采集") }
+            }
+        }
+
+        item {
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("公众号历史增量同步（可选）", fontWeight = FontWeight.Bold)
+                    Text(
+                        "使用微信读书二维码兼容服务。令牌只保存在本机；遇到登录失效或限流会停止，不做风控规避。",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+
+                    val cred = credential
+                    if (cred == null) {
+                        Button(
+                            enabled = !working,
+                            onClick = {
+                                scope.launch {
+                                    working = true
+                                    status = "正在生成微信读书登录二维码…"
+                                    runCatching {
+                                        withContext(Dispatchers.IO) { historyClient.createLoginSession() }
+                                    }.onSuccess {
+                                        loginSession = it
+                                        status = "请使用另一台设备上的微信扫描二维码，然后点“扫码完成”。"
+                                    }.onFailure {
+                                        status = "生成二维码失败：" + it.message
+                                    }
+                                    working = false
+                                }
+                            }
+                        ) { Text("生成登录二维码") }
+
+                        val session = loginSession
+                        if (session != null) {
+                            val bitmap = remember(session.scanUrl) { makeQrBitmap(session.scanUrl) }
+                            Image(
+                                bitmap = bitmap.asImageBitmap(),
+                                contentDescription = "微信读书登录二维码",
+                                modifier = Modifier.fillMaxWidth().height(260.dp),
+                                contentScale = ContentScale.Fit
+                            )
+                            Button(
+                                enabled = !working,
+                                onClick = {
+                                    scope.launch {
+                                        working = true
+                                        status = "正在确认扫码登录…"
+                                        runCatching {
+                                            withContext(Dispatchers.IO) { historyClient.completeLogin(session.uuid) }
+                                        }.onSuccess {
+                                            credential = it
+                                            loginSession = null
+                                            status = "历史同步登录成功：" + it.username
+                                        }.onFailure {
+                                            status = "登录尚未完成或失败：" + it.message
+                                        }
+                                        working = false
+                                    }
+                                }
+                            ) { Text("扫码完成，确认登录") }
+                        }
+                    } else {
+                        Text("已登录：" + cred.username.ifBlank { cred.vid })
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(
+                                enabled = !working,
+                                modifier = Modifier.weight(1f),
+                                onClick = {
+                                    val sample = wechatUrls(input).firstOrNull()
+                                    val from = runCatching { LocalDate.parse(start.trim()) }.getOrNull()
+                                    val to = runCatching { LocalDate.parse(end.trim()) }.getOrNull()
+                                    if (sample == null || from == null || to == null || from.isAfter(to)) {
+                                        status = "请先放入该公众号任意一篇文章链接，并检查日期范围。"
+                                        return@Button
+                                    }
+
+                                    scope.launch {
+                                        working = true
+                                        var added = 0
+                                        var existed = 0
+                                        var failed = 0
+                                        var filtered = 0
+                                        var page = 1
+                                        var consecutiveExisting = 0
+                                        var stop = false
+
+                                        try {
+                                            val mp = withContext(Dispatchers.IO) {
+                                                historyClient.resolveAccount(sample, cred)
+                                            }
+                                            status = "已识别公众号：" + mp.name + "，开始同步历史索引…"
+
+                                            while (page <= 100 && !stop) {
+                                                val history = withContext(Dispatchers.IO) {
+                                                    historyClient.historyPage(mp.id, page, cred)
+                                                }
+                                                if (history.isEmpty()) break
+
+                                                var oldest: LocalDate? = null
+                                                for (item in history) {
+                                                    val date = Instant.ofEpochSecond(item.publishTime)
+                                                        .atZone(ZoneId.systemDefault()).toLocalDate()
+                                                    if (oldest == null || date.isBefore(oldest)) oldest = date
+
+                                                    if (date.isAfter(to)) continue
+                                                    if (date.isBefore(from)) continue
+
+                                                    val local = withContext(Dispatchers.IO) {
+                                                        repository.findByUrl(item.url)
+                                                    }
+                                                    if (local != null) {
+                                                        existed++
+                                                        consecutiveExisting++
+                                                        if (consecutiveExisting >= 20) {
+                                                            stop = true
+                                                            break
+                                                        }
+                                                        continue
+                                                    }
+
+                                                    consecutiveExisting = 0
+                                                    status = "同步 " + mp.name + "：第 " + page + " 页，正在保存《" + item.title + "》"
+
+                                                    val parsed = try {
+                                                        withContext(Dispatchers.IO) { collector.fetch(item.url) }
+                                                    } catch (_: Throwable) {
+                                                        failed++
+                                                        continue
+                                                    }
+
+                                                    val enriched = parsed.copy(
+                                                        account = parsed.account.ifBlank { mp.name },
+                                                        publishDate = parsed.publishDate ?: date
+                                                    )
+                                                    val fText = filter.trim()
+                                                    val authorOk = fText.isBlank() ||
+                                                        enriched.account.contains(fText, true) ||
+                                                        enriched.author.contains(fText, true)
+                                                    if (!authorOk) {
+                                                        filtered++
+                                                        continue
+                                                    }
+
+                                                    try {
+                                                        withContext(Dispatchers.IO) {
+                                                            repository.save(enriched, collector.markdown(enriched))
+                                                        }
+                                                        added++
+                                                    } catch (_: Throwable) {
+                                                        failed++
+                                                    }
+                                                }
+
+                                                if (oldest != null && oldest.isBefore(from)) stop = true
+                                                if (!stop) {
+                                                    page++
+                                                    delay(1200)
+                                                }
+                                            }
+
+                                            records = withContext(Dispatchers.IO) { repository.listAll() }
+                                            status = "历史同步完成：" + mp.name +
+                                                "；新增 " + added + "，本地已有 " + existed +
+                                                "，筛选跳过 " + filtered + "，失败 " + failed + "。"
+                                        } catch (t: Throwable) {
+                                            status = "历史同步停止：" + t.message
+                                        }
+                                        working = false
+                                    }
+                                }
+                            ) { Text("同步该公众号历史") }
+
+                            OutlinedButton(
+                                enabled = !working,
+                                modifier = Modifier.weight(1f),
+                                onClick = {
+                                    historyClient.clearCredential()
+                                    credential = null
+                                    loginSession = null
+                                    status = "已清除本机历史同步登录信息。"
+                                }
+                            ) { Text("退出历史登录") }
+                        }
+                    }
+                }
             }
         }
 
