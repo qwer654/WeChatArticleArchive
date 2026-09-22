@@ -267,8 +267,7 @@ class ArticleCollector {
     private fun regex(text: String, p: String): String? =
         Regex(p).find(text)?.groupValues?.getOrNull(1)?.trim()
 
-    private fun looksLikeDate(text: String): Boolean =
-        Regex("""\\d{4}[-/年]\\d{1,2}[-/月]\\d{1,2}""").containsMatchIn(text)
+    private fun looksLikeDate(text: String): Boolean = parseDate(text) != null
 
     private fun parseDate(text: String?): LocalDate? {
         val v = text.orEmpty()
