@@ -30,6 +30,9 @@ data class ParsedArticle(
     val hash: String
 )
 
+class VerificationRequiredException(val articleUrl: String) :
+    IllegalStateException("微信返回了环境验证页面，请使用浏览器模式完成验证后采集")
+
 data class ArticleRecord(
     val id: String,
     val url: String,
@@ -49,6 +52,14 @@ class ArchiveRepository(context: Context) {
     fun findByUrl(url: String): ArticleRecord? = db.find(canonical(url))
     fun listAll(): List<ArticleRecord> = db.all()
     fun readMarkdown(record: ArticleRecord): String = File(record.path).readText(Charsets.UTF_8)
+
+    fun isUsable(record: ArticleRecord): Boolean {
+        val file = File(record.path)
+        if (!file.exists()) return false
+        if (record.title.isBlank() || record.title == "未命名文章") return false
+        val text = runCatching { file.readText(Charsets.UTF_8) }.getOrDefault("")
+        return !isVerificationPage(text)
+    }
 
     fun save(article: ParsedArticle, markdown: String) {
         val date = article.publishDate?.toString().orEmpty()
@@ -134,8 +145,15 @@ class ArticleCollector {
 
     fun fetch(input: String): ParsedArticle {
         val url = canonical(input)
-        val html = get(url)
+        return parseHtml(url, get(url))
+    }
+
+    fun parseHtml(input: String, html: String): ParsedArticle {
+        val url = canonical(input)
         val doc = Jsoup.parse(html, url)
+        if (isVerificationPage(doc.text()) || isVerificationPage(html)) {
+            throw VerificationRequiredException(url)
+        }
 
         val title = first(
             doc.selectFirst("#activity-name")?.text(),
@@ -161,7 +179,7 @@ class ArticleCollector {
                 Instant.ofEpochSecond(seconds).atZone(ZoneId.systemDefault()).toLocalDate()
             }
 
-        val root = (doc.selectFirst("#js_content") ?: doc.selectFirst("article") ?: doc.body()).clone()
+        val root = (doc.selectFirst("#js_content") ?: doc.selectFirst(".rich_media_content") ?: doc.selectFirst("article") ?: doc.body()).clone()
         root.select("script,style,noscript").remove()
         root.select("img").forEach {
             val src = first(it.attr("data-src"), it.attr("src"))
@@ -173,6 +191,9 @@ class ArticleCollector {
         }
 
         val body = Md.convert(root).trim()
+        if (title == "未命名文章" && (body.isBlank() || isVerificationPage(body))) {
+            throw VerificationRequiredException(url)
+        }
         val hash = sha(title + "\n" + account + "\n" + author + "\n" + body)
         return ParsedArticle(sha(url), url, title, account, author, publishDate, body, hash)
     }
@@ -293,6 +314,15 @@ private object Md {
     }
 
     private fun children(n: Node): String = n.childNodes().joinToString("") { node(it) }
+}
+
+fun isVerificationPage(text: String): Boolean {
+    val normalized = text.replace("\u00a0", " ")
+    return normalized.contains("当前环境异常") ||
+        normalized.contains("环境异常") && normalized.contains("完成验证") ||
+        normalized.contains("去验证") && normalized.contains("继续访问") ||
+        normalized.contains("访问过于频繁") ||
+        normalized.contains("请完成验证后继续访问")
 }
 
 fun canonical(value: String): String {
