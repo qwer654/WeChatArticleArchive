@@ -3,6 +3,8 @@ package com.qwer654.wechatarchive
 import android.annotation.SuppressLint
 import android.graphics.Color
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.view.Gravity
 import android.view.ViewGroup
 import android.webkit.CookieManager
@@ -25,6 +27,18 @@ class WebViewCaptureActivity : ComponentActivity() {
     private val collector = ArticleCollector()
     private val repository by lazy { ArchiveRepository(applicationContext) }
     private var originalUrl: String = ""
+    private val autoHandler = Handler(Looper.getMainLooper())
+    private var captureInProgress = false
+    private var captureCompleted = false
+    private var lastAutoState = ""
+
+    private val autoCheck = object : Runnable {
+        override fun run() {
+            if (!captureCompleted && ::webView.isInitialized) {
+                checkPageForAutoCapture()
+            }
+        }
+    }
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -42,7 +56,7 @@ class WebViewCaptureActivity : ComponentActivity() {
         }
 
         statusView = TextView(this).apply {
-            text = "正在打开微信文章。若出现验证，请按页面提示完成验证后再采集。"
+            text = "正在打开微信文章。正文加载完成后会自动采集；若出现验证，请正常完成验证，之后无需再点采集。"
             setPadding(24, 18, 24, 18)
         }
 
@@ -54,7 +68,10 @@ class WebViewCaptureActivity : ComponentActivity() {
             webViewClient = object : WebViewClient() {
                 override fun onPageFinished(view: WebView?, url: String?) {
                     super.onPageFinished(view, url)
-                    statusView.text = "页面已加载。确认正文显示正确后，点击“采集当前页面”。"
+                    if (!captureCompleted) {
+                        statusView.text = "页面已加载，正在自动检测真实文章正文…"
+                        scheduleAutoCheck(350)
+                    }
                 }
             }
         }
@@ -74,8 +91,8 @@ class WebViewCaptureActivity : ComponentActivity() {
         }
 
         val capture = Button(this).apply {
-            text = "采集当前页面"
-            setOnClickListener { captureCurrentPage() }
+            text = "立即采集（备用）"
+            setOnClickListener { captureCurrentPage(auto = false) }
         }
 
         val cancel = Button(this).apply {
@@ -93,10 +110,78 @@ class WebViewCaptureActivity : ComponentActivity() {
         setContentView(root)
 
         webView.loadUrl(originalUrl)
+        scheduleAutoCheck(900)
     }
 
-    private fun captureCurrentPage() {
-        statusView.text = "正在提取当前页面正文…"
+    private fun scheduleAutoCheck(delayMs: Long = 1100L) {
+        autoHandler.removeCallbacks(autoCheck)
+        if (!captureCompleted) autoHandler.postDelayed(autoCheck, delayMs)
+    }
+
+    private fun decodeJsString(value: String?): String =
+        runCatching {
+            if (value == null || value == "null") "" else JSONArray("[" + value + "]").getString(0)
+        }.getOrDefault("")
+
+    private fun checkPageForAutoCapture() {
+        if (captureCompleted || captureInProgress) {
+            if (!captureCompleted) scheduleAutoCheck()
+            return
+        }
+
+        val script = """
+            (function() {
+                var bodyText = (document.body && document.body.innerText) ? document.body.innerText : '';
+                var blocked =
+                    bodyText.indexOf('当前环境异常') >= 0 ||
+                    (bodyText.indexOf('环境异常') >= 0 && bodyText.indexOf('完成验证') >= 0) ||
+                    (bodyText.indexOf('去验证') >= 0 && bodyText.indexOf('继续访问') >= 0) ||
+                    bodyText.indexOf('请完成验证后继续访问') >= 0;
+                var title =
+                    document.querySelector('#activity-name') ||
+                    document.querySelector('h1.rich_media_title') ||
+                    document.querySelector('.rich_media_title');
+                var content =
+                    document.querySelector('#js_content') ||
+                    document.querySelector('.rich_media_content') ||
+                    document.querySelector('article');
+                var titleText = title ? (title.innerText || title.textContent || '').trim() : '';
+                var contentText = content ? (content.innerText || content.textContent || '').trim() : '';
+                if (blocked) return 'blocked';
+                if (document.readyState === 'complete' && titleText.length > 0 && contentText.length >= 20) return 'ready';
+                return 'wait';
+            })()
+        """.trimIndent()
+
+        webView.evaluateJavascript(script) { result ->
+            when (decodeJsString(result)) {
+                "ready" -> {
+                    lastAutoState = "ready"
+                    statusView.text = "检测到真实文章正文，正在自动采集…"
+                    captureCurrentPage(auto = true)
+                }
+                "blocked" -> {
+                    if (lastAutoState != "blocked") {
+                        statusView.text = "当前是微信验证页。请正常完成验证；正文出现后 App 会自动采集。"
+                    }
+                    lastAutoState = "blocked"
+                    scheduleAutoCheck()
+                }
+                else -> {
+                    if (lastAutoState != "wait") {
+                        statusView.text = "正在等待文章正文完整加载，加载完成后会自动采集…"
+                    }
+                    lastAutoState = "wait"
+                    scheduleAutoCheck()
+                }
+            }
+        }
+    }
+
+    private fun captureCurrentPage(auto: Boolean = true) {
+        if (captureInProgress || captureCompleted) return
+        captureInProgress = true
+        statusView.text = if (auto) "正在自动提取文章正文…" else "正在提取当前页面正文…"
         webView.evaluateJavascript(
             "(function(){return document.documentElement ? document.documentElement.outerHTML : '';})()"
         ) { encoded ->
@@ -105,7 +190,9 @@ class WebViewCaptureActivity : ComponentActivity() {
             }.getOrDefault("")
 
             if (html.isBlank()) {
-                statusView.text = "没有读取到页面内容，请重新加载后再试。"
+                captureInProgress = false
+                statusView.text = "没有读取到页面内容，继续等待页面加载…"
+                scheduleAutoCheck()
                 return@evaluateJavascript
             }
 
@@ -120,22 +207,28 @@ class WebViewCaptureActivity : ComponentActivity() {
                     }
                     parsed
                 }.onSuccess {
-                    statusView.text = "采集成功：《" + it.title + "》"
-                    Toast.makeText(this@WebViewCaptureActivity, "文章已保存为 Markdown", Toast.LENGTH_SHORT).show()
+                    captureCompleted = true
+                    captureInProgress = false
+                    autoHandler.removeCallbacks(autoCheck)
+                    statusView.text = "自动采集成功：《" + it.title + "》"
+                    Toast.makeText(this@WebViewCaptureActivity, "文章已自动保存为 Markdown", Toast.LENGTH_SHORT).show()
                     setResult(RESULT_OK)
                     finish()
                 }.onFailure {
+                    captureInProgress = false
                     statusView.text = when (it) {
                         is VerificationRequiredException ->
-                            "当前仍是微信验证页。请先完成页面验证，并确认已经看到文章正文后再点击采集。"
-                        else -> "采集失败：" + (it.message ?: it.javaClass.simpleName)
+                            "当前仍是微信验证页。完成验证后会自动重新检测并采集。"
+                        else -> "暂未能解析完整正文：" + (it.message ?: it.javaClass.simpleName) + "，继续自动检测…"
                     }
+                    scheduleAutoCheck(1300)
                 }
             }
         }
     }
 
     override fun onDestroy() {
+        autoHandler.removeCallbacks(autoCheck)
         if (::webView.isInitialized) {
             webView.stopLoading()
             webView.destroy()
