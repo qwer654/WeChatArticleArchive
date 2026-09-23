@@ -1,6 +1,8 @@
 package com.qwer654.wechatarchive
 
 import android.content.Intent
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -82,6 +84,14 @@ private fun ArchiveScreen(activity: MainActivity, incomingText: String) {
     val collector = remember { ArticleCollector() }
     val historyClient = remember { WeReadHistoryClient(activity.applicationContext) }
     val scope = rememberCoroutineScope()
+    val packageInfo = remember { activity.packageManager.getPackageInfo(activity.packageName, 0) }
+    val appVersionName = packageInfo.versionName ?: "unknown"
+    val appVersionCode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+        packageInfo.longVersionCode
+    } else {
+        @Suppress("DEPRECATION")
+        packageInfo.versionCode.toLong()
+    }
     var credential by remember { mutableStateOf(historyClient.savedCredential()) }
     var loginSession by remember { mutableStateOf<LoginSession?>(null) }
 
@@ -282,7 +292,7 @@ private fun ArchiveScreen(activity: MainActivity, incomingText: String) {
                             working = false
                             val fallback = fallbackUrl
                             if (fallback != null && urls.size == 1) {
-                                status = "检测到微信环境验证页，已切换到浏览器模式。完成页面验证并看到正文后，点击“采集当前页面”。"
+                                status = "检测到微信环境验证页，已切换到浏览器模式。完成页面验证后会自动采集正文。"
                                 browserCapture.launch(
                                     Intent(activity, WebViewCaptureActivity::class.java)
                                         .putExtra(WebViewCaptureActivity.EXTRA_URL, fallback)
@@ -551,6 +561,28 @@ private fun ArchiveScreen(activity: MainActivity, incomingText: String) {
                             }) { Text("浏览器重新采集") }
                         }
                     }
+                }
+            }
+        }
+
+        item {
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text("关于", fontWeight = FontWeight.Bold)
+                    Text("软件版本：v" + appVersionName + "  (versionCode " + appVersionCode + ")")
+                    Text("签名通道：Stable Dev")
+                    Text("仓库：github.com/qwer654/WeChatArticleArchive", style = MaterialTheme.typography.bodySmall)
+                    OutlinedButton(
+                        modifier = Modifier.fillMaxWidth(),
+                        onClick = {
+                            activity.startActivity(
+                                Intent(
+                                    Intent.ACTION_VIEW,
+                                    Uri.parse("https://github.com/qwer654/WeChatArticleArchive")
+                                )
+                            )
+                        }
+                    ) { Text("打开 GitHub 仓库") }
                 }
             }
         }

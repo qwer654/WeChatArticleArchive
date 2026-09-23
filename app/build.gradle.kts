@@ -12,8 +12,23 @@ android {
         applicationId = "com.qwer654.wechatarchive"
         minSdk = 26
         targetSdk = 35
-        versionCode = 4
-        versionName = "0.1.3"
+        versionCode = 5
+        versionName = "0.1.4"
+    }
+
+    signingConfigs {
+        create("stableDebug") {
+            storeFile = file("dev-signing/wechatarchive-dev.jks")
+            storePassword = "wechatarchive-dev"
+            keyAlias = "wechatarchive-dev"
+            keyPassword = "wechatarchive-dev"
+        }
+    }
+
+    buildTypes {
+        getByName("debug") {
+            signingConfig = signingConfigs.getByName("stableDebug")
+        }
     }
 
     compileOptions {
