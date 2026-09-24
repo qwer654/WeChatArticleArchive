@@ -113,7 +113,7 @@ class WebViewCaptureActivity : ComponentActivity() {
         scheduleAutoCheck(900)
     }
 
-    private fun scheduleAutoCheck(delayMs: Long = 1100L) {
+    private fun scheduleAutoCheck(delayMs: Long = 1400L) {
         autoHandler.removeCallbacks(autoCheck)
         if (!captureCompleted) autoHandler.postDelayed(autoCheck, delayMs)
     }
@@ -224,6 +224,18 @@ class WebViewCaptureActivity : ComponentActivity() {
                     scheduleAutoCheck(1300)
                 }
             }
+        }
+    }
+
+    override fun onPause() {
+        autoHandler.removeCallbacks(autoCheck)
+        super.onPause()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (::webView.isInitialized && !captureCompleted) {
+            scheduleAutoCheck(500)
         }
     }
 
