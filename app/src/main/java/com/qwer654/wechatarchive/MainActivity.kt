@@ -110,6 +110,7 @@ private fun ArchiveApp(activity: MainActivity, incomingText: String) {
     val repository = remember { ArchiveRepository(activity.applicationContext) }
     val collector = remember { ArticleCollector() }
     val historyClient = remember { WeReadHistoryClient(activity.applicationContext) }
+    val exportStorage = remember { ExportStorage(activity.applicationContext) }
     val workflow = remember { ArchiveWorkflow(repository, collector, historyClient) }
     val scope = rememberCoroutineScope()
 
@@ -123,7 +124,8 @@ private fun ArchiveApp(activity: MainActivity, incomingText: String) {
     var syncWorking by remember { mutableStateOf(false) }
     var records by remember { mutableStateOf<List<ArticleRecord>>(emptyList()) }
     var invalidIds by remember { mutableStateOf<Set<String>>(emptySet()) }
-    var exportRecord by remember { mutableStateOf<ArticleRecord?>(null) }
+    var exportDirectoryLabel by remember { mutableStateOf(exportStorage.selectedLabel()) }
+    var hasExportDirectory by remember { mutableStateOf(exportStorage.selectedTreeUri() != null) }
     var credential by remember { mutableStateOf(historyClient.savedCredential()) }
     var loginSession by remember { mutableStateOf<LoginSession?>(null) }
 
@@ -162,24 +164,21 @@ private fun ArchiveApp(activity: MainActivity, incomingText: String) {
         }
     }
 
-    val exporter = rememberLauncherForActivityResult(
-        ActivityResultContracts.CreateDocument("text/markdown")
+    val exportFolderPicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
     ) { uri ->
-        val record = exportRecord
-        exportRecord = null
-        if (uri != null && record != null) {
-            scope.launch {
-                runCatching {
-                    withContext(Dispatchers.IO) {
-                        activity.contentResolver.openOutputStream(uri)?.use { output ->
-                            output.write(repository.readMarkdown(record).toByteArray(Charsets.UTF_8))
-                        } ?: error("无法打开目标文件")
-                    }
-                }.onSuccess {
-                    Toast.makeText(activity, "Markdown 已导出", Toast.LENGTH_SHORT).show()
-                }.onFailure {
-                    Toast.makeText(activity, "导出失败：" + (it.message ?: "未知错误"), Toast.LENGTH_LONG).show()
-                }
+        if (uri != null) {
+            runCatching {
+                exportStorage.setTreeUri(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                )
+            }.onSuccess {
+                exportDirectoryLabel = exportStorage.selectedLabel()
+                hasExportDirectory = true
+                status = "默认导出目录已设置：" + exportDirectoryLabel
+            }.onFailure {
+                status = "保存默认导出目录失败：" + (it.message ?: "未知错误")
             }
         }
     }
@@ -331,8 +330,21 @@ private fun ArchiveApp(activity: MainActivity, incomingText: String) {
                 records = records,
                 invalidIds = invalidIds,
                 onExport = { record ->
-                    exportRecord = record
-                    exporter.launch(fileName(record.publishDate + "_" + record.title + ".md"))
+                    if (!hasExportDirectory) {
+                        status = "请先在“关于”页选择默认导出目录。"
+                        selectedTab = AppTab.ABOUT
+                    } else {
+                        scope.launch {
+                            val ok = withContext(Dispatchers.IO) {
+                                runCatching { repository.exportArticle(record) }.getOrDefault(false)
+                            }
+                            status = if (ok) {
+                                "已导出到默认目录：" + exportDirectoryLabel
+                            } else {
+                                "导出失败，请检查默认目录写入权限。"
+                            }
+                        }
+                    }
                 },
                 onRecapture = { record -> openBrowserCapture(record.url) },
                 onRefresh = {
@@ -442,6 +454,33 @@ private fun ArchiveApp(activity: MainActivity, incomingText: String) {
                 modifier = Modifier.padding(inner),
                 versionName = appVersionName,
                 versionCode = appVersionCode,
+                exportDirectoryLabel = exportDirectoryLabel,
+                hasExportDirectory = hasExportDirectory,
+                onChooseExportDirectory = { exportFolderPicker.launch(null) },
+                onClearExportDirectory = {
+                    exportStorage.clearTreeUri()
+                    exportDirectoryLabel = exportStorage.selectedLabel()
+                    hasExportDirectory = false
+                    status = "已清除默认导出目录。"
+                },
+                onExportAll = {
+                    if (!hasExportDirectory) {
+                        status = "请先选择默认导出目录。"
+                    } else {
+                        scope.launch {
+                            status = "正在按公众号分类导出全部归档…"
+                            val result = withContext(Dispatchers.IO) {
+                                var ok = 0
+                                var failed = 0
+                                records.forEach { record ->
+                                    if (runCatching { repository.exportArticle(record) }.getOrDefault(false)) ok++ else failed++
+                                }
+                                ok to failed
+                            }
+                            status = "全部导出完成：成功 " + result.first + "，失败 " + result.second + "。"
+                        }
+                    }
+                },
                 onOpenRepository = {
                     activity.startActivity(
                         Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/qwer654/WeChatArticleArchive"))
@@ -845,6 +884,11 @@ private fun AboutScreen(
     modifier: Modifier,
     versionName: String,
     versionCode: Long,
+    exportDirectoryLabel: String,
+    hasExportDirectory: Boolean,
+    onChooseExportDirectory: () -> Unit,
+    onClearExportDirectory: () -> Unit,
+    onExportAll: () -> Unit,
     onOpenRepository: () -> Unit
 ) {
     LazyColumn(
@@ -858,6 +902,31 @@ private fun AboutScreen(
                     Text("公众号典藏", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
                     Text("Android 微信公众号文章本地 Markdown 归档工具")
                     Text("v" + versionName + " · versionCode " + versionCode, fontWeight = FontWeight.SemiBold)
+                }
+            }
+        }
+
+        item {
+            OutlinedCard(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text("存储与导出", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                    AboutLine("默认导出目录", exportDirectoryLabel)
+                    Text(
+                        "采集成功后会自动按“公众号名称 / 年份”分类保存 .md 和 assets 图片目录。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Button(onClick = onChooseExportDirectory, modifier = Modifier.fillMaxWidth()) {
+                        Text(if (hasExportDirectory) "更换默认导出目录" else "选择默认导出目录")
+                    }
+                    if (hasExportDirectory) {
+                        OutlinedButton(onClick = onExportAll, modifier = Modifier.fillMaxWidth()) {
+                            Text("导出全部归档到默认目录")
+                        }
+                        TextButton(onClick = onClearExportDirectory, modifier = Modifier.fillMaxWidth()) {
+                            Text("清除默认导出目录")
+                        }
+                    }
                 }
             }
         }
