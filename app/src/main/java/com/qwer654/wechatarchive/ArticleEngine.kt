@@ -62,6 +62,7 @@ class ArchiveRepository(context: Context) {
     }
 
     fun save(article: ParsedArticle, markdown: String) {
+        val previous = db.find(article.url)
         val date = article.publishDate?.toString().orEmpty()
         val year = article.publishDate?.year?.toString() ?: "unknown"
         val account = safe(article.account.ifBlank { "未知公众号" })
@@ -75,6 +76,9 @@ class ArchiveRepository(context: Context) {
                 date, file.absolutePath, article.hash, System.currentTimeMillis()
             )
         )
+        if (previous != null && previous.path != file.absolutePath) {
+            runCatching { File(previous.path).delete() }
+        }
     }
 
     private fun safe(value: String): String =
@@ -82,6 +86,10 @@ class ArchiveRepository(context: Context) {
 }
 
 private class Db(context: Context) : SQLiteOpenHelper(context, "archive.db", null, 1) {
+    init {
+        setWriteAheadLoggingEnabled(true)
+    }
+
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL(
             "CREATE TABLE articles(" +
@@ -329,8 +337,8 @@ private object Md {
 fun isVerificationPage(text: String): Boolean {
     val normalized = text.replace("\u00a0", " ")
     return normalized.contains("当前环境异常") ||
-        normalized.contains("环境异常") && normalized.contains("完成验证") ||
-        normalized.contains("去验证") && normalized.contains("继续访问") ||
+        (normalized.contains("环境异常") && normalized.contains("完成验证")) ||
+        (normalized.contains("去验证") && normalized.contains("继续访问")) ||
         normalized.contains("访问过于频繁") ||
         normalized.contains("请完成验证后继续访问")
 }
