@@ -46,43 +46,147 @@ data class ArticleRecord(
 )
 
 class ArchiveRepository(context: Context) {
-    private val db = Db(context)
-    private val root = File(context.filesDir, "archive").apply { mkdirs() }
+    private val appContext = context.applicationContext
+    private val db = Db(appContext)
+    private val root = File(appContext.filesDir, "archive").apply { mkdirs() }
+    private val exportStorage = ExportStorage(appContext)
+    private val mediaClient = OkHttpClient.Builder()
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(45, TimeUnit.SECONDS)
+        .callTimeout(60, TimeUnit.SECONDS)
+        .build()
 
     fun findByUrl(url: String): ArticleRecord? = db.find(canonical(url))
     fun listAll(): List<ArticleRecord> = db.all()
     fun readMarkdown(record: ArticleRecord): String = File(record.path).readText(Charsets.UTF_8)
+    fun exportArticle(record: ArticleRecord): Boolean = exportStorage.exportArticle(record)
 
     fun isUsable(record: ArticleRecord): Boolean {
         val file = File(record.path)
         if (!file.exists()) return false
         if (record.title.isBlank() || record.title == "未命名文章") return false
         val text = runCatching { file.readText(Charsets.UTF_8) }.getOrDefault("")
-        return !isVerificationPage(text)
+        return text.isNotBlank() && !isVerificationPage(text)
     }
 
-    fun save(article: ParsedArticle, markdown: String) {
+    fun save(article: ParsedArticle, markdown: String): ArticleRecord {
         val previous = db.find(article.url)
         val date = article.publishDate?.toString().orEmpty()
         val year = article.publishDate?.year?.toString() ?: "unknown"
-        val account = safe(article.account.ifBlank { "未知公众号" })
-        val dir = File(File(root, account), year).apply { mkdirs() }
-        val base = date.ifBlank { "unknown" } + "_" + article.title + "_" + article.id.take(8)
-        val file = File(dir, safe(base) + ".md")
-        file.writeText(markdown, Charsets.UTF_8)
-        db.upsert(
-            ArticleRecord(
-                article.id, article.url, article.title, article.account, article.author,
-                date, file.absolutePath, article.hash, System.currentTimeMillis()
-            )
+        val accountName = safe(article.account.ifBlank { "未知公众号" })
+        val yearDir = File(File(root, accountName), year).apply { mkdirs() }
+        val baseName = date.ifBlank { "unknown" } + "_" + article.title + "_" + article.id.take(8)
+        val markdownFile = File(yearDir, safe(baseName) + ".md")
+
+        val assetFolderName = safe(article.title + "_" + article.id.take(8))
+        val assetDir = File(File(yearDir, "assets"), assetFolderName).apply { mkdirs() }
+        val localizedMarkdown = localizeImages(
+            article = article,
+            markdown = markdown,
+            assetDir = assetDir,
+            relativePrefix = "assets/" + assetFolderName
         )
-        if (previous != null && previous.path != file.absolutePath) {
+
+        markdownFile.writeText(localizedMarkdown, Charsets.UTF_8)
+
+        val record = ArticleRecord(
+            id = article.id,
+            url = article.url,
+            title = article.title,
+            account = article.account,
+            author = article.author,
+            publishDate = date,
+            path = markdownFile.absolutePath,
+            hash = article.hash,
+            collectedAt = System.currentTimeMillis()
+        )
+        db.upsert(record)
+
+        if (previous != null && previous.path != markdownFile.absolutePath) {
             runCatching { File(previous.path).delete() }
+        }
+
+        if (exportStorage.selectedTreeUri() != null) {
+            runCatching { exportStorage.exportArticle(record) }
+        }
+        return record
+    }
+
+    private fun localizeImages(
+        article: ParsedArticle,
+        markdown: String,
+        assetDir: File,
+        relativePrefix: String
+    ): String {
+        return REMOTE_IMAGE.replace(markdown) { match ->
+            val alt = match.groupValues[1]
+            val url = match.groupValues[2].replace("&amp;", "&").trim()
+            val extension = imageExtension(url)
+            val fileName = "img_" + sha(url).take(12) + "." + extension
+            val target = File(assetDir, fileName)
+
+            if (!target.exists() || target.length() == 0L) {
+                runCatching { downloadImage(url, article.url, target) }
+            }
+
+            if (target.exists() && target.length() > 0L) {
+                "![" + alt + "](" + relativePrefix + "/" + fileName + ")"
+            } else {
+                match.value
+            }
+        }
+    }
+
+    private fun downloadImage(url: String, referer: String, target: File) {
+        val request = Request.Builder()
+            .url(url)
+            .header("User-Agent", "Mozilla/5.0 (Linux; Android) WeChatArticleArchive")
+            .header("Referer", referer)
+            .build()
+
+        mediaClient.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) error("图片 HTTP " + response.code)
+            val body = response.body ?: error("图片响应为空")
+            val temp = File(target.parentFile, target.name + ".part")
+            body.byteStream().use { input ->
+                temp.outputStream().use { output -> input.copyTo(output) }
+            }
+            if (temp.length() <= 0L) {
+                temp.delete()
+                error("图片内容为空")
+            }
+            if (target.exists()) target.delete()
+            if (!temp.renameTo(target)) {
+                temp.copyTo(target, overwrite = true)
+                temp.delete()
+            }
+        }
+    }
+
+    private fun imageExtension(url: String): String {
+        val format = Regex("""(?:[?&](?:wx_fmt|tp)=)(jpeg|jpg|png|gif|webp)""", RegexOption.IGNORE_CASE)
+            .find(url)?.groupValues?.getOrNull(1)?.lowercase()
+        if (!format.isNullOrBlank()) return if (format == "jpeg") "jpg" else format
+
+        val path = runCatching { URI(url).path.orEmpty() }.getOrDefault("")
+        val ext = path.substringAfterLast('.', "").lowercase()
+        return when (ext) {
+            "jpeg" -> "jpg"
+            "jpg", "png", "gif", "webp" -> ext
+            else -> "jpg"
         }
     }
 
     private fun safe(value: String): String =
-        value.replace(Regex("""[\\/:*?"<>|\r\n]+"""), "_").trim().trim('.').take(90).ifBlank { "untitled" }
+        value.replace(Regex("""[\\/:*?"<>|\r\n]+"""), "_")
+            .trim()
+            .trim('.')
+            .take(90)
+            .ifBlank { "untitled" }
+
+    companion object {
+        private val REMOTE_IMAGE = Regex("""!\[([^\]]*)]\((https?://[^)]+)\)""")
+    }
 }
 
 private class Db(context: Context) : SQLiteOpenHelper(context, "archive.db", null, 1) {
@@ -98,24 +202,34 @@ private class Db(context: Context) : SQLiteOpenHelper(context, "archive.db", nul
                 "path TEXT NOT NULL,hash TEXT NOT NULL,collected_at INTEGER NOT NULL)"
         )
         db.execSQL("CREATE INDEX idx_date ON articles(publish_date)")
+        db.execSQL("CREATE INDEX idx_account ON articles(account)")
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) = Unit
 
     fun upsert(r: ArticleRecord) {
         writableDatabase.insertWithOnConflict(
-            "articles", null,
+            "articles",
+            null,
             ContentValues().apply {
-                put("id", r.id); put("url", r.url); put("title", r.title); put("account", r.account)
-                put("author", r.author); put("publish_date", r.publishDate); put("path", r.path)
-                put("hash", r.hash); put("collected_at", r.collectedAt)
+                put("id", r.id)
+                put("url", r.url)
+                put("title", r.title)
+                put("account", r.account)
+                put("author", r.author)
+                put("publish_date", r.publishDate)
+                put("path", r.path)
+                put("hash", r.hash)
+                put("collected_at", r.collectedAt)
             },
             SQLiteDatabase.CONFLICT_REPLACE
         )
     }
 
     fun find(url: String): ArticleRecord? {
-        readableDatabase.query("articles", null, "url=?", arrayOf(url), null, null, null, "1").use {
+        readableDatabase.query(
+            "articles", null, "url=?", arrayOf(url), null, null, null, "1"
+        ).use {
             return if (it.moveToFirst()) it.record() else null
         }
     }
@@ -123,10 +237,15 @@ private class Db(context: Context) : SQLiteOpenHelper(context, "archive.db", nul
     fun all(): List<ArticleRecord> {
         val result = mutableListOf<ArticleRecord>()
         readableDatabase.query(
-            "articles", null, null, null, null, null,
+            "articles",
+            null,
+            null,
+            null,
+            null,
+            null,
             "CASE WHEN publish_date='' THEN 1 ELSE 0 END,publish_date DESC,collected_at DESC"
-        ).use { c ->
-            while (c.moveToNext()) result += c.record()
+        ).use { cursor ->
+            while (cursor.moveToNext()) result += cursor.record()
         }
         return result
     }
@@ -180,38 +299,77 @@ class ArticleCollector {
             regex(html, """var\s+nickname\s*=\s*["']([^"']+)["']""")
         )
 
-        val metaTexts = doc.select(".rich_media_meta_text").map { it.text().trim() }.filter { it.isNotBlank() }
+        val metaTexts = doc.select(".rich_media_meta_text")
+            .map { it.text().trim() }
+            .filter { it.isNotBlank() }
+
         val author = first(
             doc.selectFirst("#js_author_name")?.text(),
             doc.selectFirst("meta[name=author]")?.attr("content"),
-            regex(html, """vars+authors*=s*["']([^"']+)["']"""),
+            regex(html, """var\s+author\s*=\s*["']([^"']+)["']"""),
             metaTexts.firstOrNull { it != account && !looksLikeDate(it) && it.length <= 60 }
         )
 
         val publishDate = parseDate(doc.selectFirst("#publish_time")?.text())
             ?: metaTexts.firstNotNullOfOrNull { parseDate(it) }
-            ?: regex(html, """var\s+(?:ct|publish_time|ori_create_time)\s*=\s*["']?(\d{10,13})""")?.toLongOrNull()?.let {
-                val seconds = if (it > 99999999999L) it / 1000L else it
+            ?: regex(
+                html,
+                """var\s+(?:ct|publish_time|ori_create_time)\s*=\s*["']?(\d{10,13})"""
+            )?.toLongOrNull()?.let {
+                val seconds = if (it > 99_999_999_999L) it / 1000L else it
                 Instant.ofEpochSecond(seconds).atZone(ZoneId.systemDefault()).toLocalDate()
             }
 
-        val root = (doc.selectFirst("#js_content") ?: doc.selectFirst(".rich_media_content") ?: doc.selectFirst("article") ?: doc.body()).clone()
+        val root = (
+            doc.selectFirst("#js_content")
+                ?: doc.selectFirst(".rich_media_content")
+                ?: doc.selectFirst("article")
+                ?: doc.body()
+            ).clone()
+
         root.select("script,style,noscript").remove()
-        root.select("img").forEach {
-            val src = first(it.attr("data-src"), it.attr("src"))
-            if (src.isNotBlank()) it.attr("src", if (src.startsWith("//")) "https:" + src else src)
+
+        root.select("img").forEach { image ->
+            val src = first(image.attr("data-src"), image.attr("src"))
+            if (src.isNotBlank()) {
+                image.attr("src", normalizeResource(src))
+            }
         }
-        root.select("a[href]").forEach {
-            val abs = it.attr("abs:href")
-            if (abs.isNotBlank()) it.attr("href", abs)
+
+        root.select("a[href]").forEach { link ->
+            val absolute = link.attr("abs:href")
+            if (absolute.isNotBlank()) link.attr("href", absolute)
+        }
+
+        root.select("video,iframe,mpvideo").forEach { media ->
+            val childSource = media.selectFirst("source[src]")?.attr("src")
+            val videoUrl = first(
+                media.attr("data-src"),
+                media.attr("src"),
+                media.attr("data-url"),
+                media.attr("href"),
+                childSource,
+                url
+            )
+            media.attr("data-archive-video-url", normalizeResource(videoUrl))
         }
 
         val body = Md.convert(root).trim()
         if (title == "未命名文章" && (body.isBlank() || isVerificationPage(body))) {
             throw VerificationRequiredException(url)
         }
+
         val hash = sha(title + "\n" + account + "\n" + author + "\n" + body)
-        return ParsedArticle(sha(url), url, title, account, author, publishDate, body, hash)
+        return ParsedArticle(
+            id = sha(url),
+            url = url,
+            title = title,
+            account = account,
+            author = author,
+            publishDate = publishDate,
+            body = body,
+            hash = hash
+        )
     }
 
     fun markdown(a: ParsedArticle): String {
@@ -225,7 +383,11 @@ class ArticleCollector {
             "url: \"" + yaml(a.url) + "\"\n" +
             "article_id: \"" + a.id + "\"\n" +
             "content_hash: \"" + a.hash + "\"\n" +
-            "---\n\n# " + a.title + "\n\n" + a.body + "\n"
+            "---\n\n" +
+            "# " + a.title + "\n\n" +
+            a.body + "\n\n" +
+            "## 采集来源\n\n" +
+            "- 原文链接：[" + a.url + "](" + a.url + ")\n"
     }
 
     fun discover(page: String): List<String> {
@@ -233,17 +395,27 @@ class ArticleCollector {
         val html = get(base)
         val doc = Jsoup.parse(html, base)
         val out = linkedSetOf<String>()
-        doc.select("a[href],[data-link],[data-url]").forEach { e ->
-            listOf(e.attr("abs:href"), e.attr("href"), e.attr("data-link"), e.attr("data-url")).forEach { raw ->
-                val u = normalize(raw)
-                if (u != null && isWechat(u)) out += u
+
+        doc.select("a[href],[data-link],[data-url]").forEach { element ->
+            listOf(
+                element.attr("abs:href"),
+                element.attr("href"),
+                element.attr("data-link"),
+                element.attr("data-url")
+            ).forEach { raw ->
+                val normalized = normalize(raw)
+                if (normalized != null && isWechat(normalized)) out += normalized
             }
         }
+
         val plain = html.replace("\\/", "/").replace("&amp;", "&")
-        Regex("""https?://mp\.weixin\.qq\.com/[^\s"'<>\\]+""").findAll(plain).forEach {
-            val u = normalize(it.value)
-            if (u != null && isWechat(u)) out += u
-        }
+        Regex("""https?://mp\.weixin\.qq\.com/[^\s"'<>\\]+""")
+            .findAll(plain)
+            .forEach {
+                val normalized = normalize(it.value)
+                if (normalized != null && isWechat(normalized)) out += normalized
+            }
+
         return out.toList()
     }
 
@@ -253,6 +425,7 @@ class ArticleCollector {
             .header("User-Agent", "WeChatArticleArchive/0.1 Android")
             .header("Accept-Language", "zh-CN,zh;q=0.9")
             .build()
+
         client.newCall(request).execute().use {
             if (!it.isSuccessful) error("HTTP " + it.code)
             return it.body?.string() ?: error("空响应")
@@ -265,6 +438,14 @@ class ArticleCollector {
         return runCatching { canonical(value) }.getOrNull()
     }
 
+    private fun normalizeResource(raw: String): String {
+        val value = raw.trim()
+        return when {
+            value.startsWith("//") -> "https:" + value
+            else -> value
+        }
+    }
+
     private fun isWechat(url: String): Boolean = runCatching {
         URI(url).host.equals("mp.weixin.qq.com", true)
     }.getOrDefault(false)
@@ -272,66 +453,86 @@ class ArticleCollector {
     private fun first(vararg values: String?): String =
         values.firstOrNull { !it.isNullOrBlank() }?.trim().orEmpty()
 
-    private fun regex(text: String, p: String): String? =
-        Regex(p).find(text)?.groupValues?.getOrNull(1)?.trim()
+    private fun regex(text: String, pattern: String): String? =
+        Regex(pattern).find(text)?.groupValues?.getOrNull(1)?.trim()
 
     private fun looksLikeDate(text: String): Boolean = parseDate(text) != null
 
     private fun parseDate(text: String?): LocalDate? {
-        val v = text.orEmpty()
+        val value = text.orEmpty()
         val formats = listOf(
             Regex("""\d{4}-\d{1,2}-\d{1,2}""") to DateTimeFormatter.ofPattern("yyyy-M-d"),
             Regex("""\d{4}/\d{1,2}/\d{1,2}""") to DateTimeFormatter.ofPattern("yyyy/M/d"),
             Regex("""\d{4}年\d{1,2}月\d{1,2}日""") to DateTimeFormatter.ofPattern("yyyy年M月d日")
         )
-        for ((r, f) in formats) {
-            val m = r.find(v)?.value ?: continue
-            runCatching { LocalDate.parse(m, f) }.getOrNull()?.let { return it }
+
+        for ((regex, formatter) in formats) {
+            val match = regex.find(value)?.value ?: continue
+            runCatching { LocalDate.parse(match, formatter) }.getOrNull()?.let { return it }
         }
         return null
     }
 
     private fun yaml(value: String): String =
-        value.replace("\\", "\\\\").replace("\"", "\\\"").replace("\r", " ").replace("\n", " ")
+        value.replace("\\", "\\\\")
+            .replace("\"", "\\\"")
+            .replace("\r", " ")
+            .replace("\n", " ")
 }
 
 private object Md {
-    fun convert(root: Element): String = children(root).replace(Regex("""\n{3,}"""), "\n\n")
+    fun convert(root: Element): String =
+        children(root).replace(Regex("""\n{3,}"""), "\n\n")
 
-    private fun node(n: Node): String = when (n) {
-        is TextNode -> n.text()
+    private fun node(node: Node): String = when (node) {
+        is TextNode -> node.text()
         is Element -> {
-            val inner = children(n)
-            when (n.normalName()) {
+            val inner = children(node)
+            when (node.normalName()) {
                 "script", "style", "noscript" -> ""
                 "br" -> "\n"
-                "p", "div", "section", "article", "figure" -> inner.trim() + "\n\n"
+                "p", "div", "section", "article", "figure", "figcaption" -> inner.trim() + "\n\n"
                 "h1" -> "# " + inner.trim() + "\n\n"
                 "h2" -> "## " + inner.trim() + "\n\n"
                 "h3" -> "### " + inner.trim() + "\n\n"
-                "strong", "b" -> "**" + inner.trim() + "**"
-                "em", "i" -> "*" + inner.trim() + "*"
+                "h4" -> "#### " + inner.trim() + "\n\n"
+                "h5" -> "##### " + inner.trim() + "\n\n"
+                "h6" -> "###### " + inner.trim() + "\n\n"
+                "strong", "b" -> if (inner.isBlank()) "" else "**" + inner.trim() + "**"
+                "em", "i" -> if (inner.isBlank()) "" else "*" + inner.trim() + "*"
+                "del", "s" -> if (inner.isBlank()) "" else "~~" + inner.trim() + "~~"
                 "a" -> {
-                    val href = n.attr("href").trim()
+                    val href = node.attr("href").trim()
                     val label = inner.trim().ifBlank { href }
                     if (href.isBlank()) label else "[" + label + "](" + href + ")"
                 }
                 "img" -> {
-                    val src = n.attr("src").trim()
-                    val alt = n.attr("alt").replace("[", "").replace("]", "")
+                    val src = node.attr("src").trim()
+                    val alt = node.attr("alt").trim().replace("[", "").replace("]", "")
                     if (src.isBlank()) "" else "\n![" + alt + "](" + src + ")\n"
                 }
-                "blockquote" -> inner.trim().lines().joinToString("\n") { "> " + it } + "\n\n"
+                "video", "iframe", "mpvideo" -> {
+                    val link = node.attr("data-archive-video-url").trim()
+                    if (link.isBlank()) {
+                        "\n> 🎬 视频占位符：原文中包含视频，请打开采集来源查看。\n\n"
+                    } else {
+                        "\n> 🎬 视频占位符：[打开视频或原文](" + link + ")\n\n"
+                    }
+                }
+                "blockquote" ->
+                    inner.trim().lines().joinToString("\n") { "> " + it } + "\n\n"
                 "li" -> "- " + inner.trim() + "\n"
                 "ul", "ol" -> "\n" + inner.trimEnd() + "\n\n"
                 "hr" -> "\n---\n\n"
+                "table" -> "\n" + node.outerHtml() + "\n\n"
                 else -> inner
             }
         }
         else -> ""
     }
 
-    private fun children(n: Node): String = n.childNodes().joinToString("") { node(it) }
+    private fun children(node: Node): String =
+        node.childNodes().joinToString("") { node(it) }
 }
 
 fun isVerificationPage(text: String): Boolean {
@@ -344,10 +545,19 @@ fun isVerificationPage(text: String): Boolean {
 }
 
 fun canonical(value: String): String {
-    val u = URI(value.trim())
-    return URI(u.scheme?.lowercase(), u.userInfo, u.host?.lowercase(), u.port, u.path, u.query, null).toString()
+    val uri = URI(value.trim())
+    return URI(
+        uri.scheme?.lowercase(),
+        uri.userInfo,
+        uri.host?.lowercase(),
+        uri.port,
+        uri.path,
+        uri.query,
+        null
+    ).toString()
 }
 
 private fun sha(value: String): String =
-    MessageDigest.getInstance("SHA-256").digest(value.toByteArray(Charsets.UTF_8))
+    MessageDigest.getInstance("SHA-256")
+        .digest(value.toByteArray(Charsets.UTF_8))
         .joinToString("") { "%02x".format(it) }
