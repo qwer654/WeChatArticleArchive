@@ -166,18 +166,22 @@ private fun ArchiveApp(activity: MainActivity, incomingText: String) {
         ActivityResultContracts.CreateDocument("text/markdown")
     ) { uri ->
         val record = exportRecord
+        exportRecord = null
         if (uri != null && record != null) {
-            runCatching {
-                activity.contentResolver.openOutputStream(uri)?.use { output ->
-                    output.write(repository.readMarkdown(record).toByteArray(Charsets.UTF_8))
-                } ?: error("无法打开目标文件")
-            }.onSuccess {
-                Toast.makeText(activity, "Markdown 已导出", Toast.LENGTH_SHORT).show()
-            }.onFailure {
-                Toast.makeText(activity, "导出失败：" + (it.message ?: "未知错误"), Toast.LENGTH_LONG).show()
+            scope.launch {
+                runCatching {
+                    withContext(Dispatchers.IO) {
+                        activity.contentResolver.openOutputStream(uri)?.use { output ->
+                            output.write(repository.readMarkdown(record).toByteArray(Charsets.UTF_8))
+                        } ?: error("无法打开目标文件")
+                    }
+                }.onSuccess {
+                    Toast.makeText(activity, "Markdown 已导出", Toast.LENGTH_SHORT).show()
+                }.onFailure {
+                    Toast.makeText(activity, "导出失败：" + (it.message ?: "未知错误"), Toast.LENGTH_LONG).show()
+                }
             }
         }
-        exportRecord = null
     }
 
     val browserCapture = rememberLauncherForActivityResult(
@@ -284,28 +288,33 @@ private fun ArchiveApp(activity: MainActivity, incomingText: String) {
                             status = "没有找到微信公众号文章链接。"
                         else -> scope.launch {
                             captureWorking = true
-                            val result = workflow.captureBatch(
-                                urls = urls,
-                                from = from,
-                                to = to,
-                                filter = filter
-                            ) { message -> status = message }
-                            refreshArchive()
-                            captureWorking = false
+                            try {
+                                val result = workflow.captureBatch(
+                                    urls = urls,
+                                    from = from,
+                                    to = to,
+                                    filter = filter
+                                ) { message -> status = message }
+                                refreshArchive()
 
-                            val blocked = result.verificationUrls.distinct()
-                            status = "采集完成：新增 " + result.added +
-                                "，已有 " + result.existed +
-                                "，筛选跳过 " + result.filtered +
-                                "，需浏览器处理 " + blocked.size +
-                                "，其他失败 " + result.failed + "。"
+                                val blocked = result.verificationUrls.distinct()
+                                status = "采集完成：新增 " + result.added +
+                                    "，已有 " + result.existed +
+                                    "，筛选跳过 " + result.filtered +
+                                    "，需浏览器处理 " + blocked.size +
+                                    "，其他失败 " + result.failed + "。"
 
-                            if (blocked.size == 1 && urls.size == 1) {
-                                status = "微信要求页面验证，已切换浏览器模式；验证完成后会自动采集。"
-                                openBrowserCapture(blocked.first())
-                            } else if (blocked.isNotEmpty()) {
-                                input = blocked.joinToString("\n")
-                                status += " 需浏览器处理的链接已放回输入框。"
+                                if (blocked.size == 1 && urls.size == 1) {
+                                    status = "微信要求页面验证，已切换浏览器模式；验证完成后会自动采集。"
+                                    openBrowserCapture(blocked.first())
+                                } else if (blocked.isNotEmpty()) {
+                                    input = blocked.joinToString("\n")
+                                    status += " 需浏览器处理的链接已放回输入框。"
+                                }
+                            } catch (t: Throwable) {
+                                status = "采集任务中止：" + (t.message ?: t.javaClass.simpleName)
+                            } finally {
+                                captureWorking = false
                             }
                         }
                     }
@@ -400,25 +409,30 @@ private fun ArchiveApp(activity: MainActivity, incomingText: String) {
                             status = "日期格式不正确，请使用 YYYY-MM-DD。"
                         else -> scope.launch {
                             syncWorking = true
-                            val result = workflow.syncHistory(
-                                sampleUrl = sample,
-                                from = from,
-                                to = to,
-                                filter = filter,
-                                credential = cred
-                            ) { message -> status = message }
-                            refreshArchive()
-                            syncWorking = false
+                            try {
+                                val result = workflow.syncHistory(
+                                    sampleUrl = sample,
+                                    from = from,
+                                    to = to,
+                                    filter = filter,
+                                    credential = cred
+                                ) { message -> status = message }
+                                refreshArchive()
 
-                            val blocked = result.verificationUrls.distinct()
-                            if (blocked.isNotEmpty()) input = blocked.joinToString("\n")
-                            status = "历史同步完成：" + result.accountName +
-                                "；新增 " + result.added +
-                                "，已有 " + result.existed +
-                                "，筛选跳过 " + result.filtered +
-                                "，需浏览器采集 " + blocked.size +
-                                "，其他失败 " + result.failed + "。" +
-                                if (blocked.isNotEmpty()) " 验证链接已放回输入框。" else ""
+                                val blocked = result.verificationUrls.distinct()
+                                if (blocked.isNotEmpty()) input = blocked.joinToString("\n")
+                                status = "历史同步完成：" + result.accountName +
+                                    "；新增 " + result.added +
+                                    "，已有 " + result.existed +
+                                    "，筛选跳过 " + result.filtered +
+                                    "，需浏览器采集 " + blocked.size +
+                                    "，其他失败 " + result.failed + "。" +
+                                    if (blocked.isNotEmpty()) " 验证链接已放回输入框。" else ""
+                            } catch (t: Throwable) {
+                                status = "历史同步停止：" + (t.message ?: t.javaClass.simpleName)
+                            } finally {
+                                syncWorking = false
+                            }
                         }
                     }
                 }
