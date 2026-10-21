@@ -5,6 +5,7 @@ import android.content.Intent
 import android.net.Uri
 import androidx.documentfile.provider.DocumentFile
 import java.io.File
+import java.util.Base64
 
 class ExportStorage(private val context: Context) {
     private val prefs = context.getSharedPreferences("export_storage", Context.MODE_PRIVATE)
@@ -52,36 +53,35 @@ class ExportStorage(private val context: Context) {
         val markdownFile = File(record.path)
         if (!markdownFile.exists()) return false
         val markdown = markdownFile.readText(Charsets.UTF_8)
+        val packedMarkdown = inlineLocalImages(markdownFile, markdown)
 
         val targetMd = yearDir.replaceFile(markdownFile.name, "text/markdown") ?: return false
         context.contentResolver.openOutputStream(targetMd.uri, "w")?.use { output ->
-            markdownFile.inputStream().use { input -> input.copyTo(output) }
+            output.write(packedMarkdown.toByteArray(Charsets.UTF_8))
         } ?: return false
 
-        val refs = IMAGE_REF.findAll(markdown)
-            .map { it.groupValues[1].trim() }
-            .filter { it.startsWith("assets/") && !it.contains("..") }
-            .distinct()
-            .toList()
-
-        refs.forEach { relative ->
-            val source = File(markdownFile.parentFile, relative)
-            if (!source.exists() || !source.isFile) return@forEach
-
-            val parts = relative.split('/').filter { it.isNotBlank() }
-            if (parts.size < 2) return@forEach
-
-            var dir = yearDir
-            parts.dropLast(1).forEach { part ->
-                dir = dir.ensureDirectory(safePart(part)) ?: return@forEach
-            }
-
-            val target = dir.replaceFile(parts.last(), mimeTypeFor(source.extension)) ?: return@forEach
-            context.contentResolver.openOutputStream(target.uri, "w")?.use { output ->
-                source.inputStream().use { input -> input.copyTo(output) }
-            }
-        }
         return true
+    }
+
+    private fun inlineLocalImages(markdownFile: File, markdown: String): String {
+        return IMAGE_REF.replace(markdown) { match ->
+            val alt = match.groupValues[1]
+            val relative = match.groupValues[2].trim()
+            if (!relative.startsWith("assets/") || relative.contains("..")) {
+                return@replace match.value
+            }
+
+            val source = File(markdownFile.parentFile, relative)
+            if (!source.exists() || !source.isFile || source.length() <= 0L) {
+                return@replace match.value
+            }
+
+            val bytes = runCatching { source.readBytes() }.getOrNull()
+                ?: return@replace match.value
+            val mime = mimeTypeFor(source.extension)
+            val encoded = Base64.getEncoder().encodeToString(bytes)
+            "![" + alt + "](data:" + mime + ";base64," + encoded + ")"
+        }
     }
 
     private fun DocumentFile.ensureDirectory(name: String): DocumentFile? =
