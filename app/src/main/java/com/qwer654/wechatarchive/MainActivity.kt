@@ -527,7 +527,7 @@ private fun CaptureScreen(
                         style = MaterialTheme.typography.titleLarge,
                         fontWeight = FontWeight.Bold
                     )
-                    Text("本地索引去重 · 验证页自动切换浏览器 · 单篇独立导出")
+                    Text("本地索引去重 · 图片原位内嵌 Markdown · 单篇独立导出")
                     Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                         StatPill("已归档", localCount.toString())
                         StatPill("需重采", invalidCount.toString())
@@ -912,7 +912,7 @@ private fun AboutScreen(
                     Text("存储与导出", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                     AboutLine("默认导出目录", exportDirectoryLabel)
                     Text(
-                        "采集成功后会自动按“公众号名称 / 年份”分类保存 .md 和 assets 图片目录。",
+                        "采集成功后会自动按“公众号名称 / 年份”分类保存；图片按原文位置 Base64 内嵌到单个 .md，不再依赖 assets 目录。",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -950,7 +950,7 @@ private fun AboutScreen(
             OutlinedCard(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text("数据原则", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                    Text("• 文章以独立 Markdown 保存，数据库只管理索引与同步状态。")
+                    Text("• 文章以独立 Markdown 保存，正文图片按原位置内嵌进 .md。")
                     Text("• 已有有效文章不会重复下载。")
                     Text("• 微信返回验证页时不保存错误正文，正常验证后自动采集。")
                     Text("• 不伪装微信客户端，不窃取 Cookie，不绕过平台风控。")
