@@ -17,6 +17,7 @@ import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import java.util.Base64
 import java.util.concurrent.TimeUnit
 
 data class ParsedArticle(
@@ -78,16 +79,12 @@ class ArchiveRepository(context: Context) {
         val baseName = date.ifBlank { "unknown" } + "_" + article.title + "_" + article.id.take(8)
         val markdownFile = File(yearDir, safe(baseName) + ".md")
 
-        val assetFolderName = safe(article.title + "_" + article.id.take(8))
-        val assetDir = File(File(yearDir, "assets"), assetFolderName).apply { mkdirs() }
-        val localizedMarkdown = localizeImages(
+        val packedMarkdown = embedRemoteImages(
             article = article,
-            markdown = markdown,
-            assetDir = assetDir,
-            relativePrefix = "assets/" + assetFolderName
+            markdown = markdown
         )
 
-        markdownFile.writeText(localizedMarkdown, Charsets.UTF_8)
+        markdownFile.writeText(packedMarkdown, Charsets.UTF_8)
 
         val record = ArticleRecord(
             id = article.id,
@@ -112,32 +109,24 @@ class ArchiveRepository(context: Context) {
         return record
     }
 
-    private fun localizeImages(
+    private fun embedRemoteImages(
         article: ParsedArticle,
-        markdown: String,
-        assetDir: File,
-        relativePrefix: String
+        markdown: String
     ): String {
         return REMOTE_IMAGE.replace(markdown) { match ->
             val alt = match.groupValues[1]
             val url = match.groupValues[2].replace("&amp;", "&").trim()
-            val extension = imageExtension(url)
-            val fileName = "img_" + sha(url).take(12) + "." + extension
-            val target = File(assetDir, fileName)
+            val packed = runCatching { downloadImageAsDataUri(url, article.url) }.getOrNull()
 
-            if (!target.exists() || target.length() == 0L) {
-                runCatching { downloadImage(url, article.url, target) }
-            }
-
-            if (target.exists() && target.length() > 0L) {
-                "![" + alt + "](" + relativePrefix + "/" + fileName + ")"
-            } else {
+            if (packed.isNullOrBlank()) {
                 match.value
+            } else {
+                "![" + alt + "](" + packed + ")"
             }
         }
     }
 
-    private fun downloadImage(url: String, referer: String, target: File) {
+    private fun downloadImageAsDataUri(url: String, referer: String): String {
         val request = Request.Builder()
             .url(url)
             .header("User-Agent", "Mozilla/5.0 (Linux; Android) WeChatArticleArchive")
@@ -147,33 +136,48 @@ class ArchiveRepository(context: Context) {
         mediaClient.newCall(request).execute().use { response ->
             if (!response.isSuccessful) error("图片 HTTP " + response.code)
             val body = response.body ?: error("图片响应为空")
-            val temp = File(target.parentFile, target.name + ".part")
-            body.byteStream().use { input ->
-                temp.outputStream().use { output -> input.copyTo(output) }
-            }
-            if (temp.length() <= 0L) {
-                temp.delete()
-                error("图片内容为空")
-            }
-            if (target.exists()) target.delete()
-            if (!temp.renameTo(target)) {
-                temp.copyTo(target, overwrite = true)
-                temp.delete()
-            }
+            val bytes = body.bytes()
+            if (bytes.isEmpty()) error("图片内容为空")
+
+            val contentType = body.contentType()?.toString()?.substringBefore(';')
+                ?.takeIf { it.startsWith("image/") }
+                ?: detectImageMime(bytes, url)
+
+            val encoded = Base64.getEncoder().encodeToString(bytes)
+            return "data:" + contentType + ";base64," + encoded
         }
     }
 
-    private fun imageExtension(url: String): String {
-        val format = Regex("""(?:[?&](?:wx_fmt|tp)=)(jpeg|jpg|png|gif|webp)""", RegexOption.IGNORE_CASE)
-            .find(url)?.groupValues?.getOrNull(1)?.lowercase()
-        if (!format.isNullOrBlank()) return if (format == "jpeg") "jpg" else format
+    private fun detectImageMime(bytes: ByteArray, url: String): String {
+        if (bytes.size >= 12) {
+            if (bytes[0] == 0x47.toByte() && bytes[1] == 0x49.toByte() && bytes[2] == 0x46.toByte()) {
+                return "image/gif"
+            }
+            if (
+                bytes[0] == 0x89.toByte() &&
+                bytes[1] == 0x50.toByte() &&
+                bytes[2] == 0x4E.toByte() &&
+                bytes[3] == 0x47.toByte()
+            ) {
+                return "image/png"
+            }
+            if (bytes[0] == 0xFF.toByte() && bytes[1] == 0xD8.toByte()) {
+                return "image/jpeg"
+            }
+            if (
+                String(bytes.copyOfRange(0, 4), Charsets.US_ASCII) == "RIFF" &&
+                String(bytes.copyOfRange(8, 12), Charsets.US_ASCII) == "WEBP"
+            ) {
+                return "image/webp"
+            }
+        }
 
-        val path = runCatching { URI(url).path.orEmpty() }.getOrDefault("")
-        val ext = path.substringAfterLast('.', "").lowercase()
-        return when (ext) {
-            "jpeg" -> "jpg"
-            "jpg", "png", "gif", "webp" -> ext
-            else -> "jpg"
+        val lower = url.lowercase()
+        return when {
+            "wx_fmt=png" in lower || lower.substringBefore('?').endsWith(".png") -> "image/png"
+            "wx_fmt=gif" in lower || lower.substringBefore('?').endsWith(".gif") -> "image/gif"
+            "wx_fmt=webp" in lower || lower.substringBefore('?').endsWith(".webp") -> "image/webp"
+            else -> "image/jpeg"
         }
     }
 
